@@ -1,0 +1,18 @@
+{
+  "name": "연세노블병원 통합포털",
+  "short_name": "YN포털",
+  "description": "연세노블병원 통합 업무 포털",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#F7F5F0",
+  "theme_color": "#1B3A5C",
+  "icons": [
+    {
+      "src": "./icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
