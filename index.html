@@ -18,7 +18,7 @@
 <script type="module">
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js';
 import { getFirestore, collection, addDoc, getDocs, setDoc, deleteDoc,
-         doc, orderBy, query, serverTimestamp, getDoc, updateDoc }
+         doc, orderBy, query, serverTimestamp, getDoc, updateDoc, deleteField }
   from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js';
 
 const firebaseConfig = {
@@ -35,18 +35,68 @@ let ADMIN_PASSWORD = "nova1234!"; /* 초기값 — Firestore 로드 후 덮어�
 const app = initializeApp(firebaseConfig);
 const db  = getFirestore(app);
 
+/* ── 비밀번호 해시 (PBKDF2-SHA256, 계정마다 다른 salt) ── */
+const PW_ITER = 150000;
+function _b64(bytes){ let s=''; bytes.forEach(b=>{ s+=String.fromCharCode(b); }); return btoa(s); }
+function _unb64(str){ return Uint8Array.from(atob(str), c=>c.charCodeAt(0)); }
+
+async function hashPw(pw, saltB64){
+  if(!window.crypto||!crypto.subtle) throw new Error('HTTPS 연결 환경에서만 비밀번호를 저장할 수 있습니다.');
+  const salt = saltB64 ? _unb64(saltB64) : crypto.getRandomValues(new Uint8Array(16));
+  const key  = await crypto.subtle.importKey('raw', new TextEncoder().encode(pw), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits({name:'PBKDF2', salt, iterations:PW_ITER, hash:'SHA-256'}, key, 256);
+  return { hash:_b64(new Uint8Array(bits)), salt:_b64(salt) };
+}
+
+/* 저장된 레코드와 입력값 비교 — 해시(신규) 또는 평문(구버전) 모두 지원 */
+async function checkPassword(input, rec){
+  if(rec.passwordHash && rec.salt){
+    const h = await hashPw(input, rec.salt);
+    return h.hash === rec.passwordHash;
+  }
+  return rec.password === input;
+}
+
+/* ── 관리자 계정 ── */
+let ADMIN_PW_REC = null;   /* Firestore _config/admin 레코드. null이면 기본값 사용 */
+
 /* Firestore에서 관리자 아이디/비번 로드 */
 async function loadAdminPassword(){
   try{
     const snap = await getDoc(doc(db,'_config','admin'));
     if(snap.exists()){
-      if(snap.data().password) ADMIN_PASSWORD = snap.data().password;
-      if(snap.data().adminId)  ADMIN_ID       = snap.data().adminId;
+      const d = snap.data();
+      if(d.passwordHash || d.password) ADMIN_PW_REC = d;
+      if(d.adminId) ADMIN_ID = d.adminId;
     }
   }catch(e){ /* 실패시 기본값 유지 */ }
 }
 
-const APP_LIST = [
+function checkAdminPassword(pw){
+  return checkPassword(pw, ADMIN_PW_REC || {password: ADMIN_PASSWORD});
+}
+
+/* 구버전 평문 관리자 비번을 해시로 바꿈 (로그인 성공 시 1회) */
+async function upgradeAdminRecord(pw){
+  try{
+    const h = await hashPw(pw);
+    const {password:_old, ...rest} = ADMIN_PW_REC;
+    await setDoc(doc(db,'_config','admin'), {...rest, passwordHash:h.hash, salt:h.salt});
+    ADMIN_PW_REC = {...rest, passwordHash:h.hash, salt:h.salt};
+  }catch(e){ /* 변환 실패해도 로그인은 유지 */ }
+}
+
+/* 구버전 평문 직원 비번을 해시로 바꿈 (로그인 성공 시 1회) */
+async function upgradeStaffRecord(id, data, pw){
+  try{
+    const h = await hashPw(pw);
+    const {password:_old, ...rest} = data;
+    await setDoc(doc(db,'staff',id), {...rest, passwordHash:h.hash, salt:h.salt});
+  }catch(e){ /* 변환 실패해도 로그인은 유지 */ }
+}
+
+/* 기본 앱 목록 — Firestore(_config/apps)에 저장본이 없을 때만 사용 */
+const DEFAULT_APPS = [
   { id:'home-nursing',  name:'가정간호 의뢰지',    icon:'🏠', url:'https://ysnoble1898-ux.github.io/ysnb-n/',                              desc:'가정간호 환자 의뢰 접수 및 현황 관리' },
   { id:'order-system',  name:'소모품 발주',         icon:'📦', url:'https://minseuk04-cloud.github.io/order-system/',                        desc:'부서별 소모품 주문 및 발주 현황 관리' },
   { id:'report-24h',    name:'24시간 보고서',       icon:'📋', url:'https://ysnoble1898-ux.github.io/ysnb-24report/',                        desc:'간호 24시간 인수인계 PWA 보고 시스템' },
@@ -56,6 +106,21 @@ const APP_LIST = [
   { id:'wage-app',      name:'근무수당 관리',        icon:'💰', url:'https://ysnoble1898-ux.github.io/wage-app/',                            desc:'야간·특수 근무 수당 통합 관리 시스템' },
   { id:'duty',          name:'간호 듀티표',          icon:'📅', url:'https://minseuk04-cloud.github.io/Duty/index_v8_Firebase.html',         desc:'간호 인력 듀티 스케줄 편성 및 조회' },
 ];
+
+/* 현재 사용 중인 앱 목록 (로그인/새로고침 시 Firestore에서 갱신) */
+let APP_LIST = DEFAULT_APPS.map(a=>({...a}));
+
+async function loadAppList(){
+  try{
+    const snap = await getDoc(doc(db,'_config','apps'));
+    if(snap.exists() && Array.isArray(snap.data().list)) APP_LIST = snap.data().list;
+  }catch(e){ /* 실패 시 현재 목록(기본값) 유지 */ }
+}
+
+async function saveAppList(list){
+  await setDoc(doc(db,'_config','apps'), {list, updatedAt: serverTimestamp()});
+  APP_LIST = list;
+}
 
 let currentUser = null;
 
@@ -68,16 +133,18 @@ async function doLogin() {
   if(!id||!pw){err.textContent='아이디와 비밀번호를 입력하세요.';return;}
   btn.disabled=true;btn.textContent='확인 중…';err.textContent='';
   try{
-    await loadAdminPassword(); /* 최신 비번 로드 */
-    if(id===ADMIN_ID&&pw===ADMIN_PASSWORD){
+    await Promise.all([loadAdminPassword(), loadAppList()]); /* 최신 비번·앱 목록 로드 */
+    if(id===ADMIN_ID && await checkAdminPassword(pw)){
+      if(ADMIN_PW_REC && !ADMIN_PW_REC.passwordHash) await upgradeAdminRecord(pw);
       currentUser={id:'admin',name:'관리자',dept:'원무과',role:'admin',perms:APP_LIST.map(a=>a.id)};
       enterPortal();return;
     }
     const snap=await getDoc(doc(db,'staff',id));
     if(!snap.exists()){err.textContent='존재하지 않는 아이디입니다.';return;}
     const data=snap.data();
-    if(data.password!==pw){err.textContent='비밀번호가 올바르지 않습니다.';return;}
+    if(!(await checkPassword(pw,data))){err.textContent='비밀번호가 올바르지 않습니다.';return;}
     if(data.disabled){err.textContent='비활성화된 계정입니다. 관리자에게 문의하세요.';return;}
+    if(!data.passwordHash) await upgradeStaffRecord(id,data,pw);
     currentUser={id,name:data.name,dept:data.dept,role:'staff',perms:data.perms||[]};
     enterPortal();
   }catch(e){err.textContent='오류: '+e.message;}
@@ -141,7 +208,7 @@ function openIframe(ap){
   document.querySelectorAll('.nav-item').forEach(b=>b.classList.remove('active'));
 
   /* 페이지 영역 숨기고 iframe 뷰어 표시 */
-  ['dashboard','notice-room','apps','admin'].forEach(p=>{
+  ['dashboard','notice-room','apps','admin','app-admin'].forEach(p=>{
     document.getElementById('page-'+p)?.classList.add('hidden');
   });
 
@@ -258,14 +325,15 @@ async function submitNotice(){
   const type=document.getElementById('n-type').value;
   const content=document.getElementById('n-content').value.trim();
   const btn=document.getElementById('submit-btn');
-  if(!title){alert('제목을 입력하세요.');return;}
+  const msg=document.getElementById('n-msg'); msg.textContent='';
+  if(!title){msg.textContent='제목을 입력하세요.';return;}
   btn.disabled=true;btn.textContent='등록 중…';
   try{
     await addDoc(collection(db,'notices'),{title,type,content,createdAt:serverTimestamp()});
     ['n-title','n-content'].forEach(id=>document.getElementById(id).value='');
     document.getElementById('notice-form').classList.add('hidden');
     loadNotices();
-  }catch(e){alert('등록 실패: '+e.message);}
+  }catch(e){msg.textContent='등록 실패: '+e.message;}
   finally{btn.disabled=false;btn.textContent='등록하기';}
 }
 async function deleteNotice(id){
@@ -274,28 +342,38 @@ async function deleteNotice(id){
 }
 
 /* ── 직원 관리 ── */
+let _staffRows=[];
 async function loadStaff(){
   const tbody=document.getElementById('staff-tbody');
   tbody.innerHTML='<tr><td colspan="6" class="tbl-loading">불러오는 중…</td></tr>';
   try{
     const snap=await getDocs(collection(db,'staff'));
-    const rows=[];
-    snap.forEach(d=>rows.push({id:d.id,...d.data()}));
-    rows.sort((a,b)=>(a.dept+a.name).localeCompare(b.dept+b.name,'ko'));
-    tbody.innerHTML='';
-    if(!rows.length){tbody.innerHTML='<tr><td colspan="6" class="tbl-loading">등록된 직원이 없습니다.</td></tr>';return;}
-    rows.forEach(s=>{
-      const tr=document.createElement('tr');
-      tr.innerHTML=buildStaffRow(s);tbody.appendChild(tr);
-    });
+    _staffRows=[];
+    snap.forEach(d=>_staffRows.push({id:d.id,...d.data()}));
+    _staffRows.sort((a,b)=>(a.dept+a.name).localeCompare(b.dept+b.name,'ko'));
+    renderStaffRows();
   }catch(e){tbody.innerHTML=`<tr><td colspan="6" class="tbl-loading">⚠ ${e.message}</td></tr>`;}
 }
+/* 검색어(이름·부서·아이디)로 걸러서 표 다시 그리기 */
+function renderStaffRows(){
+  const tbody=document.getElementById('staff-tbody');
+  const q=(document.getElementById('staff-search')?.value||'').trim().toLowerCase();
+  const list=_staffRows.filter(s=>!q||[s.name,s.dept,s.id].some(v=>String(v||'').toLowerCase().includes(q)));
+  tbody.innerHTML='';
+  if(!_staffRows.length){tbody.innerHTML='<tr><td colspan="6" class="tbl-loading">등록된 직원이 없습니다.</td></tr>';return;}
+  if(!list.length){tbody.innerHTML='<tr><td colspan="6" class="tbl-loading">검색 결과가 없습니다.</td></tr>';return;}
+  list.forEach(s=>{
+    const tr=document.createElement('tr');
+    tr.innerHTML=buildStaffRow(s);tbody.appendChild(tr);
+  });
+}
+function filterStaff(){ renderStaffRows(); }
 function buildStaffRow(s){
   const cnt=(s.perms||[]).length;
   const status=s.disabled?'<span class="badge-disabled">비활성</span>':'<span class="badge-active">활성</span>';
   return `<td class="td-dept">${s.dept||''}</td>
     <td>${s.name||''}</td><td class="td-id">${s.id}</td>
-    <td class="td-pw">${s.password||''}</td>
+    <td class="td-pw"><span class="pw-mask" title="비밀번호는 암호화되어 보관됩니다. 변경하려면 편집하세요.">••••••</span></td>
     <td>${cnt}/${APP_LIST.length}개 앱 ${status}</td>
     <td class="td-actions">
       <button class="tbl-btn btn-edit" onclick="window.Portal.openEditModal('${s.id}')">편집</button>
@@ -307,18 +385,20 @@ async function submitStaff(){
   const pw=document.getElementById('s-pw').value.trim();
   const name=document.getElementById('s-name').value.trim();
   const dept=document.getElementById('s-dept').value.trim();
-  if(!id||!pw||!name||!dept){alert('모든 필드를 입력하세요.');return;}
-  if(id==='admin'){alert('"admin" 아이디는 사용 불가합니다.');return;}
+  const msg=document.getElementById('s-msg'); msg.textContent='';
+  if(!id||!pw||!name||!dept){msg.textContent='모든 필드를 입력하세요.';return;}
+  if(id==='admin'){msg.textContent='"admin" 아이디는 사용 불가합니다.';return;}
   const perms=[];
   document.querySelectorAll('.perm-cb:checked').forEach(cb=>perms.push(cb.value));
   const btn=document.getElementById('staff-submit-btn');
   btn.disabled=true;btn.textContent='저장 중…';
   try{
     const ex=await getDoc(doc(db,'staff',id));
-    if(ex.exists()){alert('이미 존재하는 아이디입니다.');return;}
-    await setDoc(doc(db,'staff',id),{name,dept,password:pw,perms,disabled:false});
+    if(ex.exists()){msg.textContent='이미 존재하는 아이디입니다.';return;}
+    const h=await hashPw(pw);
+    await setDoc(doc(db,'staff',id),{name,dept,passwordHash:h.hash,salt:h.salt,perms,disabled:false});
     closeStaffForm();loadStaff();
-  }catch(e){alert('저장 실패: '+e.message);}
+  }catch(e){msg.textContent='저장 실패: '+e.message;}
   finally{btn.disabled=false;btn.textContent='등록하기';}
 }
 async function deleteStaff(id,name){
@@ -332,7 +412,8 @@ async function openEditModal(id){
   document.getElementById('em-id').value=s.id;
   document.getElementById('em-name').value=s.name||'';
   document.getElementById('em-dept').value=s.dept||'';
-  document.getElementById('em-pw').value=s.password||'';
+  document.getElementById('em-pw').value='';   /* 비밀번호는 보관 형식상 표시하지 않음 */
+  document.getElementById('em-msg').textContent='';
   document.getElementById('em-disabled').checked=!!s.disabled;
   const box=document.getElementById('em-perms');
   box.innerHTML='';
@@ -348,15 +429,21 @@ async function saveEditModal(){
   const dept=document.getElementById('em-dept').value.trim();
   const pw=document.getElementById('em-pw').value.trim();
   const disabled=document.getElementById('em-disabled').checked;
-  if(!name||!dept||!pw){alert('모든 필드를 입력하세요.');return;}
+  const msg=document.getElementById('em-msg'); msg.textContent='';
+  if(!name||!dept){msg.textContent='이름과 부서는 필수입니다.';return;}
   const perms=[];
   document.querySelectorAll('.em-perm-cb:checked').forEach(cb=>perms.push(cb.value));
   const btn=document.getElementById('em-save-btn');
   btn.disabled=true;btn.textContent='저장 중…';
   try{
-    await updateDoc(doc(db,'staff',id),{name,dept,password:pw,perms,disabled});
+    const data={name,dept,perms,disabled};
+    if(pw){   /* 비밀번호를 입력한 경우에만 재설정 */
+      const h=await hashPw(pw);
+      data.passwordHash=h.hash; data.salt=h.salt; data.password=deleteField();
+    }
+    await updateDoc(doc(db,'staff',id),data);
     closeEditModal();loadStaff();
-  }catch(e){alert('저장 실패: '+e.message);}
+  }catch(e){msg.textContent='저장 실패: '+e.message;}
   finally{btn.disabled=false;btn.textContent='저장';}
 }
 function closeEditModal(){document.getElementById('edit-modal').classList.add('hidden');}
@@ -381,7 +468,7 @@ async function changeAdminId(){
   msg.textContent=''; msg.style.color='var(--urgent)';
 
   if(!cur||!nw){ msg.textContent='모든 항목을 입력하세요.'; return; }
-  if(cur !== ADMIN_PASSWORD){ msg.textContent='비밀번호가 올바르지 않습니다.'; return; }
+  if(!(await checkAdminPassword(cur))){ msg.textContent='비밀번호가 올바르지 않습니다.'; return; }
   if(nw.length < 3){ msg.textContent='아이디는 3자 이상이어야 합니다.'; return; }
   if(nw === 'admin' && ADMIN_ID === 'admin'){
     msg.textContent='현재와 동일한 아이디입니다.'; return;
@@ -414,7 +501,7 @@ async function changeAdminPassword(){
   msg.textContent=''; msg.style.color='var(--urgent)';
 
   if(!cur||!nw||!nw2){ msg.textContent='모든 항목을 입력하세요.'; return; }
-  if(cur !== ADMIN_PASSWORD){ msg.textContent='현재 비밀번호가 올바르지 않습니다.'; return; }
+  if(!(await checkAdminPassword(cur))){ msg.textContent='현재 비밀번호가 올바르지 않습니다.'; return; }
   if(nw.length < 4){ msg.textContent='새 비밀번호는 4자 이상이어야 합니다.'; return; }
   if(nw !== nw2){ msg.textContent='새 비밀번호가 일치하지 않습니다.'; return; }
 
@@ -423,8 +510,10 @@ async function changeAdminPassword(){
   try{
     const snap = await getDoc(doc(db,'_config','admin'));
     const existing = snap.exists() ? snap.data() : {};
-    await setDoc(doc(db,'_config','admin'),{ ...existing, password: nw });
-    ADMIN_PASSWORD = nw;
+    const h = await hashPw(nw);
+    const {password:_old, ...rest} = existing;
+    await setDoc(doc(db,'_config','admin'),{ ...rest, passwordHash: h.hash, salt: h.salt });
+    ADMIN_PW_REC = { ...rest, passwordHash: h.hash, salt: h.salt };
     msg.style.color='var(--green)';
     msg.textContent='✅ 비밀번호가 변경되었습니다.';
     document.getElementById('ap-current').value='';
@@ -434,12 +523,133 @@ async function changeAdminPassword(){
   finally{ btn.disabled=false; btn.textContent='변경하기'; }
 }
 
+/* ── 앱 관리 ── */
+let _appEditIdx = null;   /* null = 신규 추가, 숫자 = 수정 중인 인덱스 */
+
+function appEsc(s){
+  return String(s ?? '').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function refreshAppViews(){
+  if(currentUser) buildPortal();   /* 사이드바·대시보드·전체 앱 재생성 */
+}
+
+async function loadAppAdmin(){
+  await loadAppList();
+  renderAppTable();
+}
+
+function renderAppTable(){
+  const tbody=document.getElementById('app-tbody');
+  document.getElementById('app-list-msg').textContent='';
+  if(!APP_LIST.length){
+    tbody.innerHTML='<tr><td colspan="6" class="tbl-loading">등록된 앱이 없습니다. 「＋ 앱 추가」로 등록하세요.</td></tr>';
+    return;
+  }
+  const last=APP_LIST.length-1;
+  tbody.innerHTML=APP_LIST.map((a,i)=>`
+    <tr>
+      <td class="app-order">
+        <button class="order-btn" title="위로" ${i===0?'disabled':''} onclick="window.Portal?.moveApp(${i},-1)">▲</button>
+        <button class="order-btn" title="아래로" ${i===last?'disabled':''} onclick="window.Portal?.moveApp(${i},1)">▼</button>
+      </td>
+      <td class="app-icon-cell">${appEsc(a.icon)}</td>
+      <td><strong>${appEsc(a.name)}</strong><div class="app-id">${appEsc(a.id)}</div></td>
+      <td class="td-url"><a href="${appEsc(a.url)}" target="_blank" rel="noopener">${appEsc(a.url)}</a></td>
+      <td class="td-desc">${appEsc(a.desc||'')}</td>
+      <td class="td-actions">
+        <button class="tbl-btn btn-edit" onclick="window.Portal?.openAppForm(${i})">수정</button>
+        <button class="tbl-btn btn-del" onclick="window.Portal?.deleteApp(${i})">삭제</button>
+      </td>
+    </tr>`).join('');
+}
+
+function updateAppPreview(){
+  const icon=document.getElementById('af-icon').value.trim()||'❔';
+  const name=document.getElementById('af-name').value.trim()||'앱 이름';
+  document.getElementById('af-preview').innerHTML=
+    `<div class="app-shortcut app-preview"><span class="app-icon">${appEsc(icon)}</span><span class="app-name">${appEsc(name)}</span></div>`;
+}
+
+function openAppForm(i=null){
+  const isNew=(i===null);
+  _appEditIdx=isNew?null:i;
+  const a=isNew?{icon:'📁',name:'',url:'',desc:''}:APP_LIST[i];
+  document.getElementById('app-form-title').textContent=isNew?'신규 앱 추가':'앱 정보 수정';
+  document.getElementById('af-icon').value=a.icon;
+  document.getElementById('af-name').value=a.name;
+  document.getElementById('af-url').value=a.url;
+  document.getElementById('af-desc').value=a.desc||'';
+  document.getElementById('af-msg').textContent='';
+  updateAppPreview();
+  document.getElementById('app-form-box').classList.remove('hidden');
+  document.getElementById('af-name').focus();
+}
+
+function closeAppForm(){
+  document.getElementById('app-form-box').classList.add('hidden');
+  _appEditIdx=null;
+}
+
+async function submitApp(){
+  const icon=document.getElementById('af-icon').value.trim();
+  const name=document.getElementById('af-name').value.trim();
+  const url =document.getElementById('af-url').value.trim();
+  const desc=document.getElementById('af-desc').value.trim();
+  const msg=document.getElementById('af-msg');
+  if(!icon||!name||!url){ msg.textContent='아이콘, 앱 이름, 접속 주소는 필수입니다.'; return; }
+  if(!/^https?:\/\//i.test(url)){ msg.textContent='접속 주소는 https:// 로 시작해야 합니다.'; return; }
+
+  const idx=_appEditIdx;
+  const list=APP_LIST.map(a=>({...a}));
+  if(idx===null){
+    /* id는 한 번 만든 뒤 바꾸지 않음 — 직원 권한(perms)이 id를 참조하기 때문 */
+    list.push({id:'app-'+Date.now().toString(36), icon, name, url, desc});
+  }else{
+    list[idx]={...list[idx], icon, name, url, desc};
+  }
+
+  const btn=document.getElementById('af-save-btn');
+  btn.disabled=true; btn.textContent='저장 중…';
+  try{
+    await saveAppList(list);
+    closeAppForm();
+    renderAppTable();
+    refreshAppViews();
+  }catch(e){ msg.textContent='저장 실패: '+e.message; }
+  finally{ btn.disabled=false; btn.textContent='저장'; }
+}
+
+async function moveApp(i,dir){
+  const j=i+dir;
+  if(j<0||j>=APP_LIST.length) return;
+  const list=APP_LIST.map(a=>({...a}));
+  [list[i],list[j]]=[list[j],list[i]];
+  try{
+    await saveAppList(list);
+    renderAppTable();
+    refreshAppViews();
+  }catch(e){ document.getElementById('app-list-msg').textContent='순서 저장 실패: '+e.message; }
+}
+
+async function deleteApp(i){
+  const a=APP_LIST[i];
+  if(!confirm(`[${a.name}] 앱을 목록에서 삭제하시겠습니까?\n(직원별 권한 설정은 그대로 남지만 화면에는 표시되지 않습니다)`)) return;
+  const list=APP_LIST.filter((_,k)=>k!==i).map(x=>({...x}));
+  try{
+    await saveAppList(list);
+    renderAppTable();
+    refreshAppViews();
+  }catch(e){ document.getElementById('app-list-msg').textContent='삭제 실패: '+e.message; }
+}
+
 window.Portal={
   doLogin,doLogout,loadNotices,submitNotice,deleteNotice,
   loadStaff,submitStaff,deleteStaff,
   openStaffForm,closeStaffForm,openEditModal,saveEditModal,closeEditModal,
   openIframe,closeIframe,openInNewTab,
   changeAdminId,changeAdminPassword,
+  loadAppAdmin,openAppForm,closeAppForm,submitApp,updateAppPreview,moveApp,deleteApp,filterStaff,
 };
 
 /* ── 새로고침 세션 자동 복원 ── */
@@ -452,9 +662,9 @@ window.Portal={
     currentUser = user;
     /* DOM 준비 후 실행 */
     if(document.readyState === 'loading'){
-      document.addEventListener('DOMContentLoaded', ()=>enterPortal());
+      document.addEventListener('DOMContentLoaded', ()=>loadAppList().then(enterPortal));
     } else {
-      enterPortal();
+      loadAppList().then(enterPortal);
     }
   }catch(e){ sessionStorage.removeItem('yn_user'); }
 })();
@@ -625,7 +835,7 @@ header{position:fixed;top:0;left:0;right:0;height:var(--header-h);background:var
   transition:transform .15s,box-shadow .15s;}
 .app-shortcut:hover{transform:translateY(-2px);box-shadow:0 6px 20px rgba(42,127,143,.15);}
 .app-shortcut .app-icon{font-size:26px;}
-.app-shortcut .app-name{font-size:11.5px;font-weight:600;color:var(--text);line-height:1.3;}
+.app-shortcut .app-name{font-size:13px;font-weight:600;color:var(--text);line-height:1.3;}
 .notices-section{background:var(--white);border-radius:var(--radius);padding:20px;box-shadow:var(--shadow);}
 .dash-notice-item{padding:10px 0;border-bottom:1px solid var(--sand);}
 .dash-notice-item:last-child{border-bottom:none;}
@@ -719,6 +929,26 @@ header{position:fixed;top:0;left:0;right:0;height:var(--header-h);background:var
 .tbl-btn{font-size:11.5px;padding:4px 10px;border-radius:6px;border:none;font-weight:600;}
 .btn-edit{background:rgba(42,127,143,.12);color:var(--teal);}
 .btn-del{background:rgba(192,57,43,.1);color:var(--urgent);}
+/* ── 앱 관리 ── */
+.admin-hint{font-size:13px;color:var(--muted);line-height:1.5;}
+.app-form-layout{display:grid;grid-template-columns:1fr 200px;gap:20px;align-items:start;}
+.app-preview{cursor:default;}
+.app-preview:hover{transform:none;box-shadow:none;}
+.form-msg{font-size:12.5px;color:var(--urgent);min-height:18px;margin-bottom:8px;}
+.app-table .app-icon-cell{font-size:22px;text-align:center;width:56px;}
+.app-table .app-id{font-family:monospace;font-size:11px;color:var(--muted);margin-top:2px;}
+.app-table .td-url{max-width:260px;}
+.app-table .td-url a{color:var(--teal);font-size:12.5px;word-break:break-all;}
+.app-table .td-desc{color:var(--muted);font-size:12.5px;}
+.app-table .app-order{white-space:nowrap;}
+.pw-mask{letter-spacing:2px;color:var(--muted);}
+.toolbar-right{display:flex;gap:10px;align-items:center;flex-wrap:wrap;}
+.staff-search{width:240px;max-width:100%;}
+.order-btn{width:28px;height:26px;margin-right:4px;border:1px solid var(--sand);background:var(--white);
+  border-radius:6px;color:var(--teal);font-size:11px;cursor:pointer;}
+.order-btn:hover:not(:disabled){border-color:var(--teal);}
+.order-btn:disabled{opacity:.3;cursor:default;}
+@media(max-width:700px){.app-form-layout{grid-template-columns:1fr;}}
 .tbl-loading{text-align:center;padding:30px;color:var(--muted);}
 .badge-active{font-size:10.5px;font-weight:700;padding:2px 7px;border-radius:10px;background:rgba(22,163,74,.12);color:var(--green);}
 .badge-disabled{font-size:10.5px;font-weight:700;padding:2px 7px;border-radius:10px;background:rgba(107,114,128,.12);color:var(--muted);}
@@ -847,6 +1077,9 @@ header{position:fixed;top:0;left:0;right:0;height:var(--header-h);background:var
         <button class="nav-item" onclick="showPage('admin',this)">
           <span class="nav-icon">⚙️</span> 직원 계정 관리
         </button>
+        <button class="nav-item" onclick="showPage('app-admin',this)">
+          <span class="nav-icon">🧩</span> 앱 관리
+        </button>
       </div>
       <div class="nav-divider"></div>
     </div>
@@ -899,6 +1132,7 @@ header{position:fixed;top:0;left:0;right:0;height:var(--header-h);background:var
         </div>
         <div class="form-row"><label class="form-label">내용</label>
           <textarea id="n-content" class="form-textarea" placeholder="공지 내용을 입력하세요"></textarea></div>
+        <div id="n-msg" class="form-msg"></div>
         <div class="form-actions">
           <button class="btn-secondary" onclick="toggleForm()">취소</button>
           <button class="btn-primary" id="submit-btn" onclick="window.Portal?.submitNotice()">등록하기</button>
@@ -915,6 +1149,52 @@ header{position:fixed;top:0;left:0;right:0;height:var(--header-h);background:var
       <div class="apps-page-grid" id="apps-page-grid"></div>
     </div>
 
+    <!-- 앱 관리 패널 -->
+    <div id="page-app-admin" class="hidden">
+      <div class="page-header">
+        <div class="page-title">🧩 앱 관리 <span>/ 포털에 표시되는 업무 앱 목록</span></div>
+      </div>
+      <div class="admin-toolbar">
+        <div class="admin-hint">앱 추가·수정·순서 변경 시 대시보드, 사이드바, 직원 권한 설정에 바로 반영됩니다.</div>
+        <button class="admin-add-btn" onclick="window.Portal?.openAppForm()">＋ 앱 추가</button>
+      </div>
+      <div class="staff-form-box hidden" id="app-form-box">
+        <h3 id="app-form-title">신규 앱 추가</h3>
+        <div class="app-form-layout">
+          <div>
+            <div class="form-row-2">
+              <div class="form-row"><label class="form-label">아이콘 (이모지) *</label>
+                <input id="af-icon" class="form-input" type="text" maxlength="8" placeholder="예: 🏥"
+                  oninput="window.Portal?.updateAppPreview()"></div>
+              <div class="form-row"><label class="form-label">앱 이름 *</label>
+                <input id="af-name" class="form-input" type="text" placeholder="예: 연차 신청"
+                  oninput="window.Portal?.updateAppPreview()"></div>
+            </div>
+            <div class="form-row"><label class="form-label">접속 주소 (https://로 시작) *</label>
+              <input id="af-url" class="form-input" type="url" placeholder="https://..."></div>
+            <div class="form-row"><label class="form-label">설명</label>
+              <input id="af-desc" class="form-input" type="text" placeholder="앱에 대한 짧은 설명"></div>
+          </div>
+          <div>
+            <label class="form-label">미리보기</label>
+            <div id="af-preview"></div>
+          </div>
+        </div>
+        <div id="af-msg" class="form-msg"></div>
+        <div class="form-actions">
+          <button class="btn-secondary" onclick="window.Portal?.closeAppForm()">취소</button>
+          <button class="btn-primary" id="af-save-btn" onclick="window.Portal?.submitApp()">저장</button>
+        </div>
+      </div>
+      <div id="app-list-msg" class="form-msg"></div>
+      <div class="staff-table-wrap">
+        <table class="staff-table app-table">
+          <thead><tr><th>순서</th><th>아이콘</th><th>앱 이름</th><th>접속 주소</th><th>설명</th><th>관리</th></tr></thead>
+          <tbody id="app-tbody"><tr><td colspan="6" class="tbl-loading">데이터 로딩 중…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
     <!-- 관리자 패널 -->
     <div id="page-admin" class="hidden">
       <div class="page-header">
@@ -922,7 +1202,11 @@ header{position:fixed;top:0;left:0;right:0;height:var(--header-h);background:var
       </div>
       <div class="admin-toolbar">
         <div style="font-size:13px;color:var(--muted);">직원 계정을 등록하고 앱 접근 권한을 설정하세요.</div>
-        <button class="admin-add-btn" onclick="window.Portal?.openStaffForm()">＋ 직원 계정 등록</button>
+        <div class="toolbar-right">
+          <input id="staff-search" class="form-input staff-search" type="search" placeholder="이름·부서·아이디 검색"
+            oninput="window.Portal?.filterStaff()">
+          <button class="admin-add-btn" onclick="window.Portal?.openStaffForm()">＋ 직원 계정 등록</button>
+        </div>
       </div>
       <div class="staff-form-box hidden" id="staff-form-box">
         <h3>신규 직원 계정 등록</h3>
@@ -940,6 +1224,7 @@ header{position:fixed;top:0;left:0;right:0;height:var(--header-h);background:var
           <label class="form-label">앱 접근 권한 (체크한 항목만 접근 가능)</label>
           <div class="perm-grid" id="perm-boxes"></div>
         </div>
+        <div id="s-msg" class="form-msg"></div>
         <div class="form-actions">
           <button class="btn-secondary" onclick="window.Portal?.closeStaffForm()">취소</button>
           <button class="btn-primary" id="staff-submit-btn" onclick="window.Portal?.submitStaff()">등록하기</button>
@@ -1022,7 +1307,8 @@ header{position:fixed;top:0;left:0;right:0;height:var(--header-h);background:var
         <input id="em-dept" class="form-input" type="text"></div>
     </div>
     <div class="form-row"><label class="form-label">비밀번호</label>
-      <input id="em-pw" class="form-input" type="text"></div>
+      <input id="em-pw" class="form-input" type="password" autocomplete="new-password"
+        placeholder="변경할 때만 입력 (비워두면 그대로 유지)"></div>
     <div class="form-row">
       <label class="form-label">앱 접근 권한</label>
       <div class="em-perms-grid" id="em-perms"></div>
@@ -1033,6 +1319,7 @@ header{position:fixed;top:0;left:0;right:0;height:var(--header-h);background:var
         <label for="em-disabled">계정 비활성화 (로그인 차단)</label>
       </div>
     </div>
+    <div id="em-msg" class="form-msg"></div>
     <div class="modal-footer">
       <button class="btn-secondary" onclick="window.Portal?.closeEditModal()">취소</button>
       <button class="btn-primary" id="em-save-btn" onclick="window.Portal?.saveEditModal()">저장</button>
@@ -1049,7 +1336,7 @@ setInterval(updateClock,1000);updateClock();
 document.getElementById('dash-date').textContent=
   new Date().toLocaleDateString('ko-KR',{year:'numeric',month:'long',day:'numeric',weekday:'long'});
 
-const PAGES=['dashboard','notice-room','apps','admin'];
+const PAGES=['dashboard','notice-room','apps','admin','app-admin'];
 function showPage(name,btn){
   /* iframe 닫기 */
   document.getElementById('iframe-viewer').classList.add('hidden');
@@ -1058,6 +1345,7 @@ function showPage(name,btn){
   document.querySelectorAll('.nav-item').forEach(b=>b.classList.remove('active'));
   if(btn?.classList?.contains('nav-item'))btn.classList.add('active');
   if(window.innerWidth<=700)document.getElementById('sidebar').classList.remove('open');
+  if(name==='app-admin'){ window.Portal?.loadAppAdmin(); }
   if(name==='admin'){
     window.Portal?.loadStaff();
     /* 현재 관리자 아이디 표시 */
